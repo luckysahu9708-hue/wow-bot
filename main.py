@@ -1,86 +1,110 @@
 import os, time, threading, requests, io, base64
-from flask import Flask, jsonify
+from flask import Flask
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
 app = Flask(__name__)
-latest_data = []
 
-def get_binance_data():
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8371820032:AAG1yD-JqUPcsy6j__6dKue0UwoC2UQyX1c")
+CHAT_ID = os.environ.get("CHAT_ID", "805026310")
+BTC_PRICE = 0
+
+def get_btc_price():
+    global BTC_PRICE
     try:
-        url = "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=100"
-        r = requests.get(url, timeout=10).json()
-        bids = [[float(p[0]), float(p[1])] for p in r['bids']]
-        asks = [[float(p[0]), float(p[1])] for p in r['asks']]
-        price_url = "https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT"
-        price = float(requests.get(price_url, timeout=10).json()['price'])
-        return bids, asks, price
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5).json()
+        BTC_PRICE = float(r['price'])
+        return BTC_PRICE
     except:
-        return [], [], 0
+        return BTC_PRICE or 115000
 
-def make_chart_image(bids, asks, price):
-    plt.figure(figsize=(10,5))
-    if bids: plt.scatter([b[0] for b in bids], [b[1] for b in bids], c='green', label='Long Liquidity', alpha=0.6)
-    if asks: plt.scatter([a[0] for a in asks], [a[1] for a in asks], c='red', label='Short Liquidity', alpha=0.6)
-    plt.axvline(price, color='yellow', linestyle='--', label=f'BTC: ${price}')
-    plt.title(f'Lucky Heatmap - BTC ${price}')
-    plt.xlabel('Price'); plt.ylabel('Size'); plt.legend(); plt.grid(True, alpha=0.3)
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', facecolor='black', edgecolor='none')
-    plt.close()
-    buf.seek(0)
-    return buf
+def get_heatmap_image():
+    try:
+        # Binance orderbook
+        r = requests.get("https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=500", timeout=10).json()
+        bids = [(float(p[0]), float(p[1])) for p in r['bids']]
+        asks = [(float(p[0]), float(p[1])) for p in r['asks']]
 
-def bot_loop():
-    global latest_data
+        price = get_btc_price()
+        if price == 0: price = 115000
+
+        # Filter near price +- 2000$
+        bids = [b for b in bids if price-2000 < b[0] < price+2000]
+        asks = [a for a in asks if price-2000 < a[0] < price+2000]
+
+        fig, ax = plt.subplots(figsize=(8,4), facecolor='black')
+        ax.set_facecolor('black')
+
+        # Plot bids green
+        if bids:
+            bx, by = zip(*bids)
+            ax.scatter(bx, [1]*len(bx), c='lime', s=[y*20 for y in by], alpha=0.6, label='BIDS')
+        if asks:
+            axx, axy = zip(*asks)
+            ax.scatter(axx, [1]*len(axx), c='red', s=[y*20 for y in axy], alpha=0.6, label='ASKS')
+
+        ax.axvline(price, color='yellow', linestyle='--', label=f'BTC: ${price:,.0f}')
+        ax.set_ylim(0.5, 1.5)
+        ax.set_xlim(price-1500, price+1500)
+        ax.tick_params(colors='white')
+        ax.legend(facecolor='black', edgecolor='white', labelcolor='white')
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', facecolor='black', dpi=120)
+        plt.close(fig)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode()
+    except Exception as e:
+        print("Heatmap error:", e)
+        return None
+
+LATEST_IMG = None
+
+def telegram_loop():
+    global LATEST_IMG
     while True:
         try:
-            bids, asks, price = get_binance_data()
-            if price:
-                latest_data = {"bids": bids[:20], "asks": asks[:20], "price": price}
-                img = make_chart_image(bids, asks, price)
-                if BOT_TOKEN and CHAT_ID:
-                    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-                    requests.post(url, data={"chat_id": CHAT_ID, "caption": f"🔥 Lucky Heatmap - BTC ${price}\nLive: https://lucky-heatmap.onrender.com"}, files={"photo": img}, timeout=20)
-            time.sleep(300) # 5 min pe Telegram pe
+            img_b64 = get_heatmap_image()
+            if img_b64:
+                LATEST_IMG = img_b64
+                # send to telegram
+                img_bytes = base64.b64decode(img_b64)
+                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+                files = {'photo': ('heatmap.png', img_bytes)}
+                data = {'chat_id': CHAT_ID, 'caption': f'🔥 BTC: ${get_btc_price():,.2f} - Lucky Heatmap LIVE'}
+                requests.post(url, files=files, data=data, timeout=15)
+                print("Telegram photo sent")
         except Exception as e:
-            print(e); time.sleep(10)
+            print("Telegram error:", e)
+        time.sleep(300) # 5 min me ek baar
 
-@app.route('/')
+@app.route("/")
 def home():
-    return """
-    <html><head><title>Lucky Heatmap</title>
-    <meta http-equiv="refresh" content="10">
-    <style>body{background:#000;color:#fff;text-align:center;font-family:Arial} img{width:95%;max-width:1000px;}</style>
-    </head><body>
-    <h1>🔥 Lucky Heatmap - LIVE</h1>
-    <h3 id="price">Loading...</h3>
-    <img id="chart" src="/chart">
+    global LATEST_IMG
+    if not LATEST_IMG:
+        LATEST_IMG = get_heatmap_image()
+        price = get_btc_price()
+    else:
+        price = BTC_PRICE
+
+    if not LATEST_IMG:
+        return "<h1 style='color:white;background:black'>Loading... refresh in 5 sec</h1><script>setTimeout(()=>location.reload(),5000)</script>"
+
+    return f"""
+    <html>
+    <head><title>Lucky Heatmap</title><meta http-equiv="refresh" content="10"></head>
+    <body style="background:black;color:white;text-align:center;font-family:Arial">
+    <h2>🔥 Lucky Heatmap - LIVE</h2>
+    <h3>BTC: ${price:,.2f}</h3>
+    <img src="data:image/png;base64,{LATEST_IMG}" style="width:95%;max-width:900px;border:1px solid #333">
     <p>Auto refreshes every 10 sec | Telegram bot also active</p>
-    <script>
-    async function load(){
-        let d=await fetch('/api').then(r=>r.json());
-        document.getElementById('price').innerText='BTC: $'+d.price;
-        document.getElementById('chart').src='/chart?'+Date.now();
-    }
-    setInterval(load, 10000); load();
-    </script></body></html>
+    </body></html>
     """
 
-@app.route('/api')
-def api():
-    return jsonify(latest_data)
+# Start thread
+threading.Thread(target=telegram_loop, daemon=True).start()
 
-@app.route('/chart')
-def chart():
-    bids, asks, price = get_binance_data()
-    buf = make_chart_image(bids, asks, price)
-    return buf.getvalue(), 200, {'Content-Type': 'image/png'}
-
-if __name__ == '__main__':
-    threading.Thread(target=bot_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
